@@ -9,6 +9,8 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 AUDIO_PATH = "cloned_voices/0.mp3"
 SPEAKER_NAME = "debug_speaker_0"
 
+# Test script to create a voice using the ElevenLabs API
+
 
 def create_voice(audio_path, speaker_name):
     """Create a cloned voice using ElevenLabs API"""
