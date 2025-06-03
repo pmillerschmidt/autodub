@@ -11,7 +11,7 @@ import requests
 import librosa
 import soundfile as sf
 import tempfile
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer
 from pydub import AudioSegment
 from dotenv import load_dotenv
 import io
@@ -19,12 +19,14 @@ from collections import defaultdict
 
 load_dotenv()
 
+# Default voices
 ELEVENLABS_VOICES = [
     os.getenv("ELEVENLABS_VOICE_1"),
     os.getenv("ELEVENLABS_VOICE_2"),
     os.getenv("ELEVENLABS_VOICE_3"),
 ]
 
+# Cache directory for cloned voices
 VOICE_CACHE_DIR = "cloned_voices"
 os.makedirs(VOICE_CACHE_DIR, exist_ok=True)
 
@@ -47,6 +49,7 @@ class DubRequest(BaseModel):
 
 
 def download_video(url, session_id):
+    """Download video and audio from YouTube"""
     audio_path = f"temp/{session_id}.m4a"
     video_path = f"temp/{session_id}.mp4"
     subprocess.run(
@@ -57,6 +60,7 @@ def download_video(url, session_id):
 
 
 def extract_background(input_path: str):
+    """Extract background audio from the input audio file"""
     subprocess.run(
         ["demucs", "--two-stems", "vocals", "-o", "temp", input_path], check=True
     )
@@ -65,6 +69,7 @@ def extract_background(input_path: str):
 
 
 def transcribe_audio(audio_path):
+    """Transcribe audio using Deepgram"""
     deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
     with open(audio_path, "rb") as audio_file:
         headers = {
@@ -86,6 +91,7 @@ def transcribe_audio(audio_path):
 
 
 def collect_speaker_audio(segments, audio_path):
+    """Collect speaker audio from the input audio file"""
     original_audio = AudioSegment.from_file(audio_path)
     speaker_audio = defaultdict(AudioSegment.silent)
 
@@ -112,6 +118,7 @@ def collect_speaker_audio(segments, audio_path):
 
 
 def group_segments(words):
+    """Group words by speaker"""
     segments = []
     current_speaker = None
     current_segment = []
@@ -174,9 +181,36 @@ def create_cloned_voice(speaker, voice_path, eleven_api_key):
         return None
 
 
+def translate(text, translator, tokenizer, max_tokens=450):
+    """Translate text into target language"""
+    words = text.split()
+    chunks = []
+    current_chunk = []
+
+    for word in words:
+        current_chunk.append(word)
+        tokens = tokenizer(
+            " ".join(current_chunk), return_tensors="pt", truncation=False
+        )["input_ids"]
+        if tokens.shape[1] >= max_tokens:
+            chunks.append(" ".join(current_chunk[:-1]))
+            current_chunk = [word]
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    translated_chunks = translator(chunks)
+    return " ".join(chunk["translation_text"] for chunk in translated_chunks)
+
+
 def translate_and_synthesize_segments(
     segments, target_lang, tts_path, clone_voice, speaker_clips=None
 ):
+    """Translate and synthesize segments"""
+    valid_langs = ["es", "fr", "de", "ja", "it", "pt", "nl", "ru", "zh"]
+    if target_lang not in valid_langs:
+        raise ValueError(f"Unsupported target language: {target_lang}")
+
     translator = pipeline("translation", model=f"Helsinki-NLP/opus-mt-en-{target_lang}")
     eleven_api_key = os.getenv("ELEVENLABS_API_KEY")
     headers = {"xi-api-key": eleven_api_key}
@@ -191,7 +225,7 @@ def translate_and_synthesize_segments(
         end_ms = int(float(group[-1]["end"]) * 1000)
         segment_duration = end_ms - start_ms
 
-        translated = translator(text)[0]["translation_text"]
+        translated = translate(text, translator, translator.tokenizer)
 
         if clone_voice:
             voice_path = os.path.join(VOICE_CACHE_DIR, f"{speaker}.mp3")

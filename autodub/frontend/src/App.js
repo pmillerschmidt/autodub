@@ -94,6 +94,11 @@ function App() {
               <option value="fr">French</option>
               <option value="de">German</option>
               <option value="ja">Japanese</option>
+              <option value="it">Italian</option>
+            <option value="pt">Portuguese</option>
+            <option value="nl">Dutch</option>
+            <option value="ru">Russian</option>
+            <option value="zh">Chinese</option>
             </select>
           </div>
 
