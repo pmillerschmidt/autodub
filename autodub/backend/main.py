@@ -7,6 +7,9 @@ import subprocess
 import uuid
 import os
 import requests
+import librosa
+import soundfile as sf
+import tempfile
 from transformers import pipeline
 from pydub import AudioSegment
 from dotenv import load_dotenv
@@ -15,12 +18,14 @@ from collections import defaultdict
 
 load_dotenv()
 
-# Cycle through a list of predefined voices for different speakers
 ELEVENLABS_VOICES = [
     os.getenv("ELEVENLABS_VOICE_1"),
     os.getenv("ELEVENLABS_VOICE_2"),
     os.getenv("ELEVENLABS_VOICE_3"),
 ]
+
+VOICE_CACHE_DIR = "cloned_voices"
+os.makedirs(VOICE_CACHE_DIR, exist_ok=True)
 
 app = FastAPI()
 
@@ -36,6 +41,9 @@ app.add_middleware(
 class DubRequest(BaseModel):
     url: str
     target_lang: str
+    clone_voice: bool = False
+    separate_vocals: bool = False
+    keep_background: bool = False
 
 
 def download_video(url, session_id):
@@ -46,6 +54,14 @@ def download_video(url, session_id):
     )
     subprocess.run(["yt-dlp", "-f", "bestvideo", "-o", video_path, url], check=True)
     return audio_path, video_path
+
+
+def isolate_vocals(input_path: str, output_path: str):
+    subprocess.run(
+        ["demucs", "--two-stems", "vocals", "-o", "temp", input_path], check=True
+    )
+    song_name = os.path.splitext(os.path.basename(input_path))[0]
+    return os.path.join("temp", "htdemucs", song_name, "vocals.wav")
 
 
 def transcribe_audio(audio_path):
@@ -93,23 +109,16 @@ def group_segments(words):
     return segments
 
 
-def translate_and_synthesize_segments(segments, target_lang, tts_path):
+def translate_and_synthesize_segments(segments, target_lang, tts_path, clone_voice):
     translator = pipeline("translation", model=f"Helsinki-NLP/opus-mt-en-{target_lang}")
     eleven_api_key = os.getenv("ELEVENLABS_API_KEY")
     headers = {"xi-api-key": eleven_api_key}
 
-    final_audio = AudioSegment.silent(duration=0)
+    output_segments = []
     speaker_to_voice = {}
     voice_index = 0
-    current_position = 0
 
     for i, (speaker, group) in enumerate(segments):
-        if speaker not in speaker_to_voice:
-            speaker_to_voice[speaker] = ELEVENLABS_VOICES[
-                voice_index % len(ELEVENLABS_VOICES)
-            ]
-            voice_index += 1
-
         text = " ".join([w["word"] for w in group])
         start_ms = int(float(group[0]["start"]) * 1000)
         end_ms = int(float(group[-1]["end"]) * 1000)
@@ -117,16 +126,37 @@ def translate_and_synthesize_segments(segments, target_lang, tts_path):
 
         translated = translator(text)[0]["translation_text"]
 
-        voice_id = speaker_to_voice[speaker]
+        if clone_voice:
+            voice_path = os.path.join(VOICE_CACHE_DIR, f"{speaker}.mp3")
+            if not os.path.exists(voice_path):
+                silent_segment = AudioSegment.silent(duration=2000)
+                silent_segment.export(voice_path, format="mp3")
+            with open(voice_path, "rb") as f:
+                files = {"audio": f}
+                response = requests.post(
+                    "https://api.elevenlabs.io/v1/voices/add",
+                    headers=headers,
+                    files=files,
+                    data={"name": speaker},
+                )
+                speaker_to_voice[speaker] = response.json().get("voice_id")
+
+            voice_id = speaker_to_voice[speaker]
+        else:
+            if speaker not in speaker_to_voice:
+                speaker_to_voice[speaker] = ELEVENLABS_VOICES[
+                    voice_index % len(ELEVENLABS_VOICES)
+                ]
+                voice_index += 1
+            voice_id = speaker_to_voice[speaker]
+
+        endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
         data = {
             "text": translated,
             "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
         }
-        r = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-            json=data,
-            headers=headers,
-        )
+
+        r = requests.post(endpoint, json=data, headers=headers)
         if (
             r.status_code != 200
             or r.headers.get("Content-Type", "").split(";")[0] != "audio/mpeg"
@@ -134,16 +164,31 @@ def translate_and_synthesize_segments(segments, target_lang, tts_path):
             raise ValueError(f"TTS failed at segment {i}: {r.text}")
 
         segment_audio = AudioSegment.from_file(io.BytesIO(r.content), format="mp3")
+        generated_duration = len(segment_audio)
 
-        # Match duration: pad or trim to match original segment timing
-        if len(segment_audio) < segment_duration:
-            padding = AudioSegment.silent(
-                duration=segment_duration - len(segment_audio)
-            )
-            segment_audio += padding
-        else:
-            segment_audio = segment_audio[:segment_duration]
+        # Stretch or shrink the audio to match the original duration
+        if generated_duration > 0 and abs(generated_duration - segment_duration) > 50:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_in:
+                segment_audio.export(temp_in.name, format="wav")
+                y, sr = librosa.load(temp_in.name, sr=None)
 
+            target_duration = segment_duration / 1000.0  # in seconds
+            current_duration = librosa.get_duration(y=y, sr=sr)
+            if current_duration > 0:
+                stretch_ratio = current_duration / target_duration
+                y_stretched = librosa.effects.time_stretch(y, rate=stretch_ratio)
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".wav"
+                ) as temp_out:
+                    sf.write(temp_out.name, y_stretched, sr)
+                    segment_audio = AudioSegment.from_file(temp_out.name, format="wav")
+
+        output_segments.append((start_ms, segment_audio))
+
+    final_audio = AudioSegment.silent(duration=0)
+    current_position = 0
+
+    for start_ms, segment_audio in output_segments:
         silence = AudioSegment.silent(duration=max(0, start_ms - current_position))
         final_audio += silence + segment_audio
         current_position = start_ms + len(segment_audio)
@@ -187,14 +232,41 @@ def dub_video(req: DubRequest):
     audio_path, video_path = download_video(req.url, session_id)
     steps.append("Download complete")
 
+    if req.separate_vocals:
+        audio_path = isolate_vocals(audio_path, f"temp/{session_id}_vocals.wav")
+        steps.append("Vocal isolation complete")
+
     words = transcribe_audio(audio_path)
     steps.append("Transcription complete")
 
     segments = group_segments(words)
-    translate_and_synthesize_segments(segments, req.target_lang, tts_path)
+    translate_and_synthesize_segments(
+        segments, req.target_lang, tts_path, req.clone_voice
+    )
     steps.append("Speech synthesis complete")
 
-    merge_audio_video(video_path, tts_path, output_path)
+    if req.keep_background:
+        merge_audio_video(video_path, tts_path, output_path)
+    else:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-i",
+                video_path,
+                "-i",
+                tts_path,
+                "-c:v",
+                "copy",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-shortest",
+                output_path,
+            ],
+            check=True,
+        )
+
     steps.append("Merge complete")
 
     return {"output_url": f"/temp/{session_id}_dub.mp4", "steps": steps}
