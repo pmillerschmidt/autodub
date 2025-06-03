@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import subprocess
 import uuid
 import os
+import numpy as np
 import requests
 import librosa
 import soundfile as sf
@@ -84,6 +85,32 @@ def transcribe_audio(audio_path):
         return words
 
 
+def collect_speaker_audio(segments, audio_path):
+    original_audio = AudioSegment.from_file(audio_path)
+    speaker_audio = defaultdict(AudioSegment.silent)
+
+    for speaker, group in segments:
+        start_ms = int(float(group[0]["start"]) * 1000)
+        end_ms = int(float(group[-1]["end"]) * 1000)
+        segment_audio = original_audio[start_ms:end_ms]
+        speaker_audio[speaker] += segment_audio
+
+    for speaker, audio in speaker_audio.items():
+        if len(audio) >= 1500:
+            print(
+                f"Speaker {speaker} total duration: {len(audio) / 1000.0:.2f} seconds"
+            )
+            path = os.path.join(VOICE_CACHE_DIR, f"{speaker}.mp3")
+            audio.export(path, format="mp3")
+            print(
+                f"Saved audio for speaker {speaker} to {path}, size: {os.path.getsize(path)} bytes"
+            )
+        else:
+            print(
+                f"Skipping speaker {speaker}: audio too short ({len(audio)} ms) for cloning"
+            )
+
+
 def group_segments(words):
     segments = []
     current_speaker = None
@@ -108,7 +135,48 @@ def group_segments(words):
     return segments
 
 
-def translate_and_synthesize_segments(segments, target_lang, tts_path, clone_voice):
+def create_cloned_voice(speaker, voice_path, eleven_api_key):
+    """Create a cloned voice using the working approach"""
+    try:
+        with open(voice_path, "rb") as audio_file:
+            files = [
+                (
+                    "files",
+                    (os.path.basename(voice_path), audio_file.read(), "audio/mpeg"),
+                )
+            ]
+
+            data = {
+                "name": f"cloned_{speaker}",
+                "description": f"Cloned voice for speaker {speaker}",
+            }
+
+            response = requests.post(
+                "https://api.elevenlabs.io/v1/voices/add",
+                headers={"xi-api-key": eleven_api_key},
+                files=files,
+                data=data,
+            )
+
+        if response.status_code == 200:
+            result = response.json()
+            voice_id = result.get("voice_id")
+            print(f"[SUCCESS] Voice cloned for speaker {speaker}: {voice_id}")
+            return voice_id
+        else:
+            print(
+                f"[ERROR] Voice cloning failed for speaker {speaker}: {response.status_code} - {response.text}"
+            )
+            return None
+
+    except Exception as e:
+        print(f"[ERROR] Exception during voice cloning for speaker {speaker}: {e}")
+        return None
+
+
+def translate_and_synthesize_segments(
+    segments, target_lang, tts_path, clone_voice, speaker_clips=None
+):
     translator = pipeline("translation", model=f"Helsinki-NLP/opus-mt-en-{target_lang}")
     eleven_api_key = os.getenv("ELEVENLABS_API_KEY")
     headers = {"xi-api-key": eleven_api_key}
@@ -127,19 +195,34 @@ def translate_and_synthesize_segments(segments, target_lang, tts_path, clone_voi
 
         if clone_voice:
             voice_path = os.path.join(VOICE_CACHE_DIR, f"{speaker}.mp3")
-            if not os.path.exists(voice_path):
-                silent_segment = AudioSegment.silent(duration=2000)
-                silent_segment.export(voice_path, format="mp3")
-            with open(voice_path, "rb") as f:
-                files = {"audio": f}
-                response = requests.post(
-                    "https://api.elevenlabs.io/v1/voices/add",
-                    headers=headers,
-                    files=files,
-                    data={"name": speaker},
-                )
-                speaker_to_voice[speaker] = response.json().get("voice_id")
-
+            if speaker not in speaker_to_voice:
+                if not os.path.exists(voice_path):
+                    print(
+                        f"Voice path does not exist for speaker {speaker}: {voice_path}"
+                    )
+                    # Use default voice if cloning file doesn't exist
+                    speaker_to_voice[speaker] = ELEVENLABS_VOICES[
+                        voice_index % len(ELEVENLABS_VOICES)
+                    ]
+                    voice_index += 1
+                else:
+                    # Use the working voice cloning approach
+                    cloned_voice_id = create_cloned_voice(
+                        speaker, voice_path, eleven_api_key
+                    )
+                    if cloned_voice_id:
+                        speaker_to_voice[speaker] = cloned_voice_id
+                        print(
+                            f"Successfully cloned voice for speaker {speaker}: {cloned_voice_id}"
+                        )
+                    else:
+                        print(
+                            f"Voice cloning failed for speaker {speaker}, using default voice"
+                        )
+                        speaker_to_voice[speaker] = ELEVENLABS_VOICES[
+                            voice_index % len(ELEVENLABS_VOICES)
+                        ]
+                        voice_index += 1
             voice_id = speaker_to_voice[speaker]
         else:
             if speaker not in speaker_to_voice:
@@ -237,27 +320,33 @@ def merge_audio_video(video_path, tts_path, output_path, background_path=None):
 def dub_video(req: DubRequest):
     session_id = str(uuid.uuid4())
     os.makedirs("temp", exist_ok=True)
-
+    # init paths
     audio_path = f"temp/{session_id}.m4a"
     video_path = f"temp/{session_id}.mp4"
     tts_path = f"temp/{session_id}_tts.mp3"
     output_path = f"temp/{session_id}_dub.mp4"
-
+    # init steps
     steps = []
-
+    # download video
     audio_path, video_path = download_video(req.url, session_id)
     steps.append("Download complete")
-
+    # transcribe audio
     words = transcribe_audio(audio_path)
     steps.append("Transcription complete")
-
+    # group segments
     segments = group_segments(words)
+    # collect speaker audio
+    speaker_clips = (
+        collect_speaker_audio(segments, audio_path) if req.clone_voice else None
+    )
+    # translate and synthesize segments
     translate_and_synthesize_segments(
-        segments, req.target_lang, tts_path, req.clone_voice
+        segments, req.target_lang, tts_path, req.clone_voice, speaker_clips
     )
     steps.append("Speech synthesis complete")
-
+    # extract background
     background_path = extract_background(audio_path) if req.keep_background else None
+    # merge audio and video
     merge_audio_video(video_path, tts_path, output_path, background_path)
     steps.append("Merge complete")
 
