@@ -8,11 +8,19 @@ import uuid
 import os
 import requests
 from transformers import pipeline
+from pydub import AudioSegment
 from dotenv import load_dotenv
+import io
+from collections import defaultdict
 
 load_dotenv()
 
-VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
+# Cycle through a list of predefined voices for different speakers
+ELEVENLABS_VOICES = [
+    os.getenv("ELEVENLABS_VOICE_1"),
+    os.getenv("ELEVENLABS_VOICE_2"),
+    os.getenv("ELEVENLABS_VOICE_3"),
+]
 
 app = FastAPI()
 
@@ -48,40 +56,99 @@ def transcribe_audio(audio_path):
             "Content-Type": "audio/m4a",
         }
         response = requests.post(
-            "https://api.deepgram.com/v1/listen", headers=headers, data=audio_file
+            "https://api.deepgram.com/v1/listen?punctuate=true&utterances=false&paragraphs=false&diarize=true",
+            headers=headers,
+            data=audio_file,
         )
         transcript_json = response.json()
         if "results" not in transcript_json:
             raise ValueError(f"Transcription failed: {transcript_json}")
-        return transcript_json["results"]["channels"][0]["alternatives"][0].get(
-            "transcript", ""
+        words = transcript_json["results"]["channels"][0]["alternatives"][0].get(
+            "words", []
         )
+        return words
 
 
-def translate_text(text, target_lang):
+def group_segments(words):
+    segments = []
+    current_speaker = None
+    current_segment = []
+
+    for word in words:
+        speaker = word.get("speaker", "unknown")
+        if current_speaker is None:
+            current_speaker = speaker
+
+        if speaker == current_speaker:
+            current_segment.append(word)
+        else:
+            if current_segment:
+                segments.append((current_speaker, current_segment))
+            current_segment = [word]
+            current_speaker = speaker
+
+    if current_segment:
+        segments.append((current_speaker, current_segment))
+
+    return segments
+
+
+def translate_and_synthesize_segments(segments, target_lang, tts_path):
     translator = pipeline("translation", model=f"Helsinki-NLP/opus-mt-en-{target_lang}")
-    return translator(text)[0]["translation_text"]
-
-
-def synthesize_speech(text, tts_path):
     eleven_api_key = os.getenv("ELEVENLABS_API_KEY")
     headers = {"xi-api-key": eleven_api_key}
-    data = {
-        "text": text,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-    }
-    r = requests.post(
-        f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}",
-        json=data,
-        headers=headers,
-    )
-    if (
-        r.status_code != 200
-        or r.headers.get("Content-Type", "").split(";")[0] != "audio/mpeg"
-    ):
-        raise ValueError(f"TTS synthesis failed: {r.text}")
-    with open(tts_path, "wb") as f:
-        f.write(r.content)
+
+    final_audio = AudioSegment.silent(duration=0)
+    speaker_to_voice = {}
+    voice_index = 0
+    current_position = 0
+
+    for i, (speaker, group) in enumerate(segments):
+        if speaker not in speaker_to_voice:
+            speaker_to_voice[speaker] = ELEVENLABS_VOICES[
+                voice_index % len(ELEVENLABS_VOICES)
+            ]
+            voice_index += 1
+
+        text = " ".join([w["word"] for w in group])
+        start_ms = int(float(group[0]["start"]) * 1000)
+        end_ms = int(float(group[-1]["end"]) * 1000)
+        segment_duration = end_ms - start_ms
+
+        translated = translator(text)[0]["translation_text"]
+
+        voice_id = speaker_to_voice[speaker]
+        data = {
+            "text": translated,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        }
+        r = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            json=data,
+            headers=headers,
+        )
+        if (
+            r.status_code != 200
+            or r.headers.get("Content-Type", "").split(";")[0] != "audio/mpeg"
+        ):
+            raise ValueError(f"TTS failed at segment {i}: {r.text}")
+
+        segment_audio = AudioSegment.from_file(io.BytesIO(r.content), format="mp3")
+
+        # Match duration: pad or trim to match original segment timing
+        if len(segment_audio) < segment_duration:
+            padding = AudioSegment.silent(
+                duration=segment_duration - len(segment_audio)
+            )
+            segment_audio += padding
+        else:
+            segment_audio = segment_audio[:segment_duration]
+
+        silence = AudioSegment.silent(duration=max(0, start_ms - current_position))
+        final_audio += silence + segment_audio
+        current_position = start_ms + len(segment_audio)
+
+    final_audio.export(tts_path, format="mp3")
 
 
 def merge_audio_video(video_path, tts_path, output_path):
@@ -117,28 +184,20 @@ def dub_video(req: DubRequest):
 
     steps = []
 
-    # Step 1: Download
     audio_path, video_path = download_video(req.url, session_id)
     steps.append("Download complete")
 
-    # Step 2: Transcribe
-    transcript = transcribe_audio(audio_path)
+    words = transcribe_audio(audio_path)
     steps.append("Transcription complete")
 
-    # Step 3: Translate
-    translation = translate_text(transcript, req.target_lang)
-    steps.append("Translation complete")
-
-    # Step 4: TTS
-    synthesize_speech(translation, tts_path)
+    segments = group_segments(words)
+    translate_and_synthesize_segments(segments, req.target_lang, tts_path)
     steps.append("Speech synthesis complete")
 
-    # Step 5: Merge
     merge_audio_video(video_path, tts_path, output_path)
     steps.append("Merge complete")
 
-    return {"output_url": f"/{output_path}", "steps": steps}
+    return {"output_url": f"/temp/{session_id}_dub.mp4", "steps": steps}
 
 
-# Serve with uvicorn: uvicorn main:app --reload
 app.mount("/temp", StaticFiles(directory="temp"), name="temp")
