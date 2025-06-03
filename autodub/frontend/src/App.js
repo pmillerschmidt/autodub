@@ -7,6 +7,8 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [currentStep, setCurrentStep] = useState("");
   const [outputUrl, setOutputUrl] = useState("");
+  const [keepBackground, setKeepBackground] = useState(false);
+  const [cloneVoice, setCloneVoice] = useState(false);
 
   const handleSubmit = async () => {
     setLoading(true);
@@ -22,13 +24,15 @@ function App() {
     ];
 
     expectedSteps.forEach((step, i) => {
-      setTimeout(() => setCurrentStep(step), i * 1500); // simulate delays
+      setTimeout(() => setCurrentStep(step), i * 1500);
     });
 
     try {
       const response = await axios.post("http://localhost:8000/dub", {
         url,
         target_lang: lang,
+        keep_background: keepBackground,
+        clone_voice: cloneVoice,
       });
 
       setCurrentStep("Completed!");
@@ -51,10 +55,7 @@ function App() {
       backgroundColor: '#f5f5f5',
       fontFamily: 'Arial, sans-serif'
     }}>
-      <h1 style={{
-        color: '#333',
-        marginBottom: '2rem'
-      }}>AutoDub</h1>
+      <h1 style={{ color: '#333', marginBottom: '2rem' }}>AutoDub</h1>
 
       {!loading && !outputUrl && (
         <div style={{
@@ -68,7 +69,7 @@ function App() {
           <div style={{
             display: 'flex',
             gap: '1rem',
-            marginBottom: '2rem',
+            marginBottom: '1rem',
             flexWrap: 'wrap',
             justifyContent: 'center'
           }}>
@@ -85,7 +86,6 @@ function App() {
                 minWidth: '300px'
               }}
             />
-
             <select
               value={lang}
               onChange={(e) => setLang(e.target.value)}
@@ -101,24 +101,49 @@ function App() {
               <option value="de">German</option>
               <option value="ja">Japanese</option>
             </select>
-
-            <button
-              onClick={handleSubmit}
-              style={{
-                padding: '0.8rem 2rem',
-                backgroundColor: '#007bff',
-                color: 'white',
-                border: 'none',
-                borderRadius: '5px',
-                cursor: 'pointer',
-                transition: 'background-color 0.2s'
-              }}
-              onMouseOver={(e) => e.target.style.backgroundColor = '#0056b3'}
-              onMouseOut={(e) => e.target.style.backgroundColor = '#007bff'}
-            >
-              Dub
-            </button>
           </div>
+
+          <div style={{
+            display: 'flex',
+            justifyContent: 'center',
+            gap: '2rem',
+            marginBottom: '1.5rem'
+          }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <input
+                type="checkbox"
+                checked={keepBackground}
+                onChange={(e) => setKeepBackground(e.target.checked)}
+              />
+              Keep background audio
+            </label>
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <input
+                type="checkbox"
+                checked={cloneVoice}
+                onChange={(e) => setCloneVoice(e.target.checked)}
+              />
+              Clone voices
+            </label>
+          </div>
+
+          <button
+            onClick={handleSubmit}
+            style={{
+              padding: '0.8rem 2rem',
+              backgroundColor: '#007bff',
+              color: 'white',
+              border: 'none',
+              borderRadius: '5px',
+              cursor: 'pointer',
+              transition: 'background-color 0.2s'
+            }}
+            onMouseOver={(e) => e.target.style.backgroundColor = '#0056b3'}
+            onMouseOut={(e) => e.target.style.backgroundColor = '#007bff'}
+          >
+            Dub
+          </button>
         </div>
       )}
 

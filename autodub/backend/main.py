@@ -42,7 +42,6 @@ class DubRequest(BaseModel):
     url: str
     target_lang: str
     clone_voice: bool = False
-    separate_vocals: bool = False
     keep_background: bool = False
 
 
@@ -56,12 +55,12 @@ def download_video(url, session_id):
     return audio_path, video_path
 
 
-def isolate_vocals(input_path: str, output_path: str):
+def extract_background(input_path: str):
     subprocess.run(
         ["demucs", "--two-stems", "vocals", "-o", "temp", input_path], check=True
     )
     song_name = os.path.splitext(os.path.basename(input_path))[0]
-    return os.path.join("temp", "htdemucs", song_name, "vocals.wav")
+    return os.path.join("temp", "htdemucs", song_name, "no_vocals.wav")
 
 
 def transcribe_audio(audio_path):
@@ -166,16 +165,14 @@ def translate_and_synthesize_segments(segments, target_lang, tts_path, clone_voi
         segment_audio = AudioSegment.from_file(io.BytesIO(r.content), format="mp3")
         generated_duration = len(segment_audio)
 
-        # Stretch or shrink the audio to match the original duration
-        if generated_duration > 0 and abs(generated_duration - segment_duration) > 50:
+        if generated_duration > segment_duration:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_in:
                 segment_audio.export(temp_in.name, format="wav")
                 y, sr = librosa.load(temp_in.name, sr=None)
 
-            target_duration = segment_duration / 1000.0  # in seconds
             current_duration = librosa.get_duration(y=y, sr=sr)
             if current_duration > 0:
-                stretch_ratio = current_duration / target_duration
+                stretch_ratio = current_duration / (segment_duration / 1000.0)
                 y_stretched = librosa.effects.time_stretch(y, rate=stretch_ratio)
                 with tempfile.NamedTemporaryFile(
                     delete=False, suffix=".wav"
@@ -196,7 +193,26 @@ def translate_and_synthesize_segments(segments, target_lang, tts_path, clone_voi
     final_audio.export(tts_path, format="mp3")
 
 
-def merge_audio_video(video_path, tts_path, output_path):
+def merge_audio_video(video_path, tts_path, output_path, background_path=None):
+    if background_path:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-i",
+                tts_path,
+                "-i",
+                background_path,
+                "-filter_complex",
+                "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=3",
+                "-c:a",
+                "mp3",
+                "-y",
+                "temp/mixed_audio.mp3",
+            ],
+            check=True,
+        )
+        tts_path = "temp/mixed_audio.mp3"
+
     subprocess.run(
         [
             "ffmpeg",
@@ -232,10 +248,6 @@ def dub_video(req: DubRequest):
     audio_path, video_path = download_video(req.url, session_id)
     steps.append("Download complete")
 
-    if req.separate_vocals:
-        audio_path = isolate_vocals(audio_path, f"temp/{session_id}_vocals.wav")
-        steps.append("Vocal isolation complete")
-
     words = transcribe_audio(audio_path)
     steps.append("Transcription complete")
 
@@ -245,28 +257,8 @@ def dub_video(req: DubRequest):
     )
     steps.append("Speech synthesis complete")
 
-    if req.keep_background:
-        merge_audio_video(video_path, tts_path, output_path)
-    else:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-i",
-                video_path,
-                "-i",
-                tts_path,
-                "-c:v",
-                "copy",
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0",
-                "-shortest",
-                output_path,
-            ],
-            check=True,
-        )
-
+    background_path = extract_background(audio_path) if req.keep_background else None
+    merge_audio_video(video_path, tts_path, output_path, background_path)
     steps.append("Merge complete")
 
     return {"output_url": f"/temp/{session_id}_dub.mp4", "steps": steps}
