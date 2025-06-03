@@ -15,18 +15,7 @@ function App() {
     setCurrentStep("");
     setOutputUrl("");
 
-    const expectedSteps = [
-      "Downloading video...",
-      "Transcribing audio...",
-      "Translating transcript...",
-      "Synthesizing speech...",
-      "Merging audio and video..."
-    ];
-
-    expectedSteps.forEach((step, i) => {
-      setTimeout(() => setCurrentStep(step), i * 1500);
-    });
-
+    setCurrentStep("Processing...");
     try {
       const response = await axios.post("http://localhost:8000/dub", {
         url,
@@ -35,13 +24,18 @@ function App() {
         clone_voice: cloneVoice,
       });
 
+      const { output_url, steps } = response.data;
+      for (let step of steps) {
+        setCurrentStep(step);
+        await new Promise((res) => setTimeout(res, 800)); // optional short delay between step updates
+      }
+      
       setCurrentStep("Completed!");
-      setOutputUrl(response.data.output_url || "");
+      setOutputUrl(output_url || "");
     } catch (err) {
       console.error("Dubbing failed:", err);
       setCurrentStep("Error during processing. Check backend logs.");
     }
-
     setLoading(false);
   };
 

@@ -328,28 +328,30 @@ def dub_video(req: DubRequest):
     # init steps
     steps = []
     # download video
+    steps.append("Downloading video...")
     audio_path, video_path = download_video(req.url, session_id)
-    steps.append("Download complete")
     # transcribe audio
+    steps.append("Transcribing audio...")
     words = transcribe_audio(audio_path)
-    steps.append("Transcription complete")
     # group segments
+    steps.append("Grouping segments...")
     segments = group_segments(words)
     # collect speaker audio
+    steps.append("Collecting speaker audio...")
     speaker_clips = (
         collect_speaker_audio(segments, audio_path) if req.clone_voice else None
     )
     # translate and synthesize segments
+    steps.append("Translating and synthesizing segments...")
     translate_and_synthesize_segments(
         segments, req.target_lang, tts_path, req.clone_voice, speaker_clips
     )
-    steps.append("Speech synthesis complete")
     # extract background
+    steps.append("Extracting background...")
     background_path = extract_background(audio_path) if req.keep_background else None
     # merge audio and video
+    steps.append("Merging audio and video...")
     merge_audio_video(video_path, tts_path, output_path, background_path)
-    steps.append("Merge complete")
-
     return {"output_url": f"/temp/{session_id}_dub.mp4", "steps": steps}
 
 
